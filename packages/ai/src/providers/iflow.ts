@@ -1,8 +1,10 @@
 /**
  * iFlow provider - OpenAI-compatible API with iFlow-specific headers and extensions.
+ * Reuses openai-completions.ts logic with iFlow-specific signature calculation and headers.
  */
 
 import * as crypto from "crypto";
+import OpenAI from "openai";
 import { getEnvApiKey } from "../env-api-keys.js";
 import { calculateCost } from "../models.js";
 import type {
@@ -16,7 +18,6 @@ import type {
 	StreamOptions,
 	TextContent,
 	ThinkingContent,
-	Tool,
 	ToolCall,
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
@@ -26,82 +27,20 @@ import { buildBaseOptions, clampReasoning } from "./simple-options.js";
 
 const IFLOW_USER_AGENT = "iFlow-Cli";
 
-const IFLOW_COMPAT: Required<OpenAICompletionsCompat> = {
-	supportsStore: false,
-	supportsDeveloperRole: false,
-	supportsReasoningEffort: true,
-	supportsUsageInStreaming: true,
-	maxTokensField: "max_tokens",
-	requiresToolResultName: false,
-	requiresAssistantAfterToolResult: false,
-	requiresThinkingAsText: false,
-	requiresMistralToolIds: false,
-	thinkingFormat: "openai",
-	openRouterRouting: {},
-	vercelGatewayRouting: {},
-	supportsStrictMode: true,
-};
-
-interface IflowReasoningThinkingEnabled {
-	type: "enabled";
-}
-
-interface IflowReasoningThinkingDisabled {
-	type: "disabled";
-}
-
-interface IflowReasoningThinkingConfig {
-	enabled: boolean;
-	max_tokens?: number;
-	reasoning_level?: "low" | "medium" | "high";
-}
-
 export interface IflowOptions extends StreamOptions {
 	toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
 	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
 	/** iFlow extension field. If omitted, maxTokens is mirrored into max_new_tokens. */
 	maxNewTokens?: number;
 	/** iFlow extension fields for thinking/reasoning compatibility. */
-	thinking?: IflowReasoningThinkingEnabled | IflowReasoningThinkingDisabled | IflowReasoningThinkingConfig;
+	thinking?: { type: "enabled" | "disabled" } | boolean;
 	enableThinking?: boolean;
 	thinkingMode?: boolean;
-	reasoning?: boolean;
+	/** Enable thinking/reasoning. Can be boolean or thinking level. */
+	reasoning?: boolean | "minimal" | "low" | "medium" | "high" | "xhigh";
 	chatTemplateKwargs?: Record<string, unknown>;
 	extendFields?: Record<string, unknown>;
-	/** Optional iFlow conversation ID. Defaults to a generated UUID v4. */
-	conversationId?: string;
 }
-
-interface IflowChatCompletionChunk {
-	choices: Array<{
-		finish_reason: string | null;
-		delta: {
-			content?: string | null;
-			reasoning_content?: string;
-			reasoning?: string;
-			reasoning_text?: string;
-			tool_calls?: Array<{
-				id?: string;
-				function?: {
-					name?: string;
-					arguments?: string;
-				};
-			}>;
-		};
-	}>;
-	usage?: {
-		prompt_tokens?: number;
-		completion_tokens?: number;
-		prompt_tokens_details?: {
-			cached_tokens?: number;
-		};
-		completion_tokens_details?: {
-			reasoning_tokens?: number;
-		};
-	};
-}
-
-type StreamingBlock = TextContent | ThinkingContent | (ToolCall & { partialArgs?: string });
 
 /** Generate iFlow signature: HMAC_SHA256_HEX(apiKey, `${userAgent}:${sessionId}:${timestampMs}`) */
 function generateSignature(userAgent: string, sessionId: string, timestampMs: number, apiKey: string): string {
@@ -114,207 +53,157 @@ function generateSessionId(): string {
 	return `session-${crypto.randomUUID()}`;
 }
 
-function toOpenAIModel(model: Model<"iflow-completions">): Model<"openai-completions"> {
-	return {
-		...model,
-		api: "openai-completions",
-		compat: IFLOW_COMPAT,
-	};
+/** Normalize model IDs for iFlow-specific matching logic. */
+function normalizeIflowModelId(modelId: string): string {
+	return modelId.trim().toLowerCase();
 }
 
-function convertTools(tools: Tool[]): Array<Record<string, unknown>> {
-	return tools.map((tool) => ({
-		type: "function",
-		function: {
-			name: tool.name,
-			description: tool.description,
-			parameters: tool.parameters,
-			strict: false,
-		},
-	}));
+function isDeepSeekV32Model(modelId: string): boolean {
+	const normalized = normalizeIflowModelId(modelId);
+	return normalized === "deepseek-v3.2" || normalized === "deepseek-v3.2-chat";
 }
 
-/** Determine if thinking/reasoning is enabled based on options */
-function isThinkingEnabled(options: IflowOptions | undefined, model: Model<"iflow-completions">): boolean {
-	// If model has reasoning capability and user didn't explicitly disable it
-	if (model.reasoning) {
-		// Check explicit options
-		if (options?.thinking !== undefined) {
-			if (typeof options.thinking === "object" && "type" in options.thinking) {
-				return options.thinking.type === "enabled";
-			}
-			return Boolean(options.thinking);
+function isKimiK25Model(modelId: string): boolean {
+	const normalized = normalizeIflowModelId(modelId);
+	return normalized === "kimi-k2.5" || normalized.startsWith("kimi-k2.5-");
+}
+
+/** Models that support setThink behavior in iflow.js. */
+function supportsSetThink(modelId: string): boolean {
+	const normalized = normalizeIflowModelId(modelId);
+	return (
+		normalized === "glm-4.7" ||
+		normalized === "glm-5" ||
+		normalized === "kimi-k2-thinking" ||
+		isDeepSeekV32Model(normalized) ||
+		isKimiK25Model(normalized)
+	);
+}
+
+/** Determine if thinking/reasoning is enabled based on options. */
+function isThinkingEnabled(options: IflowOptions | undefined): boolean {
+	if (options?.thinking !== undefined) {
+		if (typeof options.thinking === "object" && "type" in options.thinking) {
+			return options.thinking.type === "enabled";
 		}
-		if (options?.enableThinking !== undefined) {
-			return options.enableThinking;
-		}
-		if (options?.thinkingMode !== undefined) {
-			return options.thinkingMode;
-		}
-		if (options?.reasoning !== undefined) {
-			return options.reasoning;
-		}
-		// Default to enabled for reasoning models
-		return true;
+		return Boolean(options.thinking);
 	}
+	if (options?.enableThinking !== undefined) return options.enableThinking;
+	if (options?.thinkingMode !== undefined) return options.thinkingMode;
+	if (options?.reasoning !== undefined) return Boolean(options.reasoning);
 	return false;
 }
 
+function getReasoningLevel(options: IflowOptions | undefined): IflowOptions["reasoningEffort"] | undefined {
+	if (typeof options?.reasoning === "string") {
+		return options.reasoning;
+	}
+	return options?.reasoningEffort;
+}
+
+/** iFlow compatibility settings - similar to z.ai with thinking: { type: "enabled" | "disabled" } */
+const IFLOW_COMPAT: Required<OpenAICompletionsCompat> = {
+	supportsStore: false,
+	supportsDeveloperRole: false,
+	supportsReasoningEffort: true,
+	supportsUsageInStreaming: true,
+	maxTokensField: "max_tokens",
+	requiresToolResultName: false,
+	requiresAssistantAfterToolResult: false,
+	requiresThinkingAsText: false,
+	requiresMistralToolIds: false,
+	thinkingFormat: "zai", // Use thinking: { type: "enabled" | "disabled" } like z.ai
+	openRouterRouting: {},
+	vercelGatewayRouting: {},
+	supportsStrictMode: true,
+};
+
 /**
  * Apply model-specific parameters based on iFlow documentation.
- * Only apply context-related parameters that are essential for model behavior.
+ * @internal Exported for testing purposes
  */
-function applyModelSpecificParams(
+export function applyModelSpecificParams(
 	model: Model<"iflow-completions">,
 	options: IflowOptions | undefined,
 	context: Context,
 ): Record<string, unknown> {
-	const thinkingEnabled = isThinkingEnabled(options, model);
+	const thinkingEnabled = isThinkingEnabled(options);
+	const reasoningLevel = getReasoningLevel(options);
 	const params: Record<string, unknown> = {};
-	const hasTools = context.tools && context.tools.length > 0;
+	const hasTools = Boolean(context.tools && context.tools.length > 0);
+	const normalizedModelId = normalizeIflowModelId(model.id);
 
-	switch (model.id) {
-		// 3) DeepSeek-V3.2 - only model rewrite for reasoning
-		case "deepseek-v3.2": {
-			// When thinking is enabled, model is rewritten to deepseek-v3.2-reasoner
-			if (thinkingEnabled) {
-				params.model = "deepseek-v3.2-reasoner";
-				// Reasoner model does not support max_tokens, remove it
-				delete params.max_tokens;
+	if (normalizedModelId === "iflow-rome-30ba3b") {
+		params.temperature = 0.7;
+		params.top_p = 0.8;
+		params.top_k = 20;
+		return params;
+	}
+
+	if (normalizedModelId === "glm-4.7") {
+		params.temperature = 1;
+		params.top_p = 0.95;
+		params.chat_template_kwargs = { enable_thinking: thinkingEnabled };
+		return params;
+	}
+
+	if (isDeepSeekV32Model(normalizedModelId)) {
+		if (thinkingEnabled) {
+			params.model = "deepseek-v3.2-reasoner";
+			params.thinking_mode = true;
+			if (reasoningLevel !== "low") {
+				params.reasoning = true;
 			}
-			break;
 		}
+		return params;
+	}
 
-		// 4) GLM-5 - only thinking configuration
-		case "glm-5": {
-			if (thinkingEnabled) {
-				params.chat_template_kwargs = { enable_thinking: true };
-				params.enable_thinking = true;
-				params.thinking = { type: "enabled" };
-			} else {
-				params.chat_template_kwargs = { enable_thinking: false };
-				params.enable_thinking = false;
-				params.thinking = { type: "disabled" };
-			}
-			break;
+	if (normalizedModelId === "glm-5") {
+		params.temperature = 1;
+		params.top_p = 0.95;
+		params.chat_template_kwargs = { enable_thinking: thinkingEnabled };
+		params.enable_thinking = thinkingEnabled;
+		params.thinking = { type: thinkingEnabled ? "enabled" : "disabled" };
+		return params;
+	}
+
+	if (normalizedModelId === "kimi-k2-thinking") {
+		if (thinkingEnabled) {
+			params.thinking_mode = true;
 		}
+		return params;
+	}
 
-		// 6) Kimi-K2-Thinking - only thinking configuration
-		case "kimi-k2-thinking": {
-			if (thinkingEnabled) {
-				params.thinking_mode = true;
-			}
-			break;
-		}
-
-		// 8) Kimi-K2.5 - only essential thinking and tool configuration
-		case "kimi-k2.5": {
-			if (thinkingEnabled) {
-				params.thinking = { type: "enabled" };
-			}
-			// When tools are present and tool_choice is not provided, add "auto"
-			if (hasTools && !options?.toolChoice) {
+	if (isKimiK25Model(normalizedModelId)) {
+		params.temperature = undefined;
+		params.top_p = 0.95;
+		params.n = 1;
+		params.presence_penalty = 0;
+		params.frequency_penalty = 0;
+		params.max_tokens = options?.maxTokens ?? model.maxTokens;
+		params.thinking = thinkingEnabled ? { type: "enabled" } : { type: "disabled" };
+		if (thinkingEnabled && hasTools) {
+			const currentChoice = options?.toolChoice;
+			if (!currentChoice || (currentChoice !== "auto" && currentChoice !== "none")) {
 				params.tool_choice = "auto";
 			}
-			break;
 		}
-
-		default:
-			break;
+		return params;
 	}
 
 	return params;
 }
 
-function buildParams(
+/**
+ * Convert messages for iFlow API using openai-completions convertMessages.
+ * @internal Exported for testing purposes
+ */
+export function convertIflowMessages(
 	model: Model<"iflow-completions">,
 	context: Context,
-	options: IflowOptions | undefined,
-	sessionId: string,
-): Record<string, unknown> {
-	const openAIModel = toOpenAIModel(model);
-	const params: Record<string, unknown> = {
-		model: model.id,
-		messages: convertMessages(openAIModel, context, IFLOW_COMPAT),
-		stream: true,
-		stream_options: { include_usage: true },
-	};
-
-	if (options?.maxTokens) {
-		params.max_tokens = options.maxTokens;
-		params.max_new_tokens = options.maxNewTokens ?? options.maxTokens;
-	} else if (options?.maxNewTokens) {
-		params.max_new_tokens = options.maxNewTokens;
-	}
-
-	if (options?.temperature !== undefined) {
-		params.temperature = options.temperature;
-	}
-
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertTools(context.tools);
-	}
-
-	if (options?.toolChoice) {
-		params.tool_choice = options.toolChoice;
-	}
-
-	if (model.reasoning) {
-		const hasExplicitThinkingFields =
-			options?.thinking !== undefined ||
-			options?.enableThinking !== undefined ||
-			options?.thinkingMode !== undefined ||
-			options?.reasoning !== undefined ||
-			options?.chatTemplateKwargs !== undefined;
-
-		if (options?.reasoningEffort) {
-			params.reasoning_effort = options.reasoningEffort;
-		}
-
-		if (options?.thinking !== undefined) {
-			params.thinking = options.thinking;
-		}
-
-		if (options?.enableThinking !== undefined) {
-			params.enable_thinking = options.enableThinking;
-		}
-
-		if (options?.thinkingMode !== undefined) {
-			params.thinking_mode = options.thinkingMode;
-		}
-
-		if (options?.reasoning !== undefined) {
-			params.reasoning = options.reasoning;
-		}
-
-		if (options?.chatTemplateKwargs) {
-			params.chat_template_kwargs = options.chatTemplateKwargs;
-		}
-
-		// Default extension mapping when only reasoningEffort is provided.
-		if (options?.reasoningEffort && !hasExplicitThinkingFields) {
-			params.thinking = { type: "enabled" };
-			params.enable_thinking = true;
-			params.reasoning = true;
-			params.chat_template_kwargs = { enable_thinking: true };
-		}
-	}
-
-	const extendFields: Record<string, unknown> = {
-		...(options?.extendFields ?? {}),
-	};
-	if (!("sessionId" in extendFields)) {
-		extendFields.sessionId = sessionId;
-	}
-	if (Object.keys(extendFields).length > 0) {
-		params.extend_fields = extendFields;
-	}
-
-	// Apply model-specific parameters (only essential context-related configurations)
-	const modelSpecificParams = applyModelSpecificParams(model, options, context);
-	Object.assign(params, modelSpecificParams);
-
-	return params;
+): Array<Record<string, unknown>> {
+	const openaiModel = model as unknown as Model<"openai-completions">;
+	return convertMessages(openaiModel, context, IFLOW_COMPAT) as unknown as Array<Record<string, unknown>>;
 }
 
 function mapStopReason(reason: string | null): StopReason {
@@ -334,38 +223,29 @@ function mapStopReason(reason: string | null): StopReason {
 	}
 }
 
-function getReasoningDelta(
-	delta: IflowChatCompletionChunk["choices"][number]["delta"],
-): { field: "reasoning_content" | "reasoning" | "reasoning_text"; value: string } | null {
-	if (delta.reasoning_content && delta.reasoning_content.length > 0) {
-		return { field: "reasoning_content", value: delta.reasoning_content };
-	}
-	if (delta.reasoning && delta.reasoning.length > 0) {
-		return { field: "reasoning", value: delta.reasoning };
-	}
-	if (delta.reasoning_text && delta.reasoning_text.length > 0) {
-		return { field: "reasoning_text", value: delta.reasoning_text };
-	}
-	return null;
-}
+function createClient(
+	model: Model<"iflow-completions">,
+	apiKey: string,
+	sessionId: string,
+	timestampMs: number,
+	signature: string,
+	optionsHeaders?: Record<string, string>,
+) {
+	const headers: Record<string, string> = {
+		...model.headers,
+		"user-agent": IFLOW_USER_AGENT,
+		"session-id": sessionId,
+		"x-iflow-signature": signature,
+		"x-iflow-timestamp": String(timestampMs),
+		...(optionsHeaders ?? {}),
+	};
 
-function extractSseDataEvents(buffer: string): { events: string[]; remaining: string } {
-	const events: string[] = [];
-	const chunks = buffer.split(/\r?\n\r?\n/);
-	const remaining = chunks.pop() ?? "";
-
-	for (const chunk of chunks) {
-		const dataLines = chunk
-			.split(/\r?\n/)
-			.filter((line) => line.startsWith("data:"))
-			.map((line) => line.slice(5).trimStart());
-
-		if (dataLines.length > 0) {
-			events.push(dataLines.join("\n"));
-		}
-	}
-
-	return { events, remaining };
+	return new OpenAI({
+		apiKey,
+		baseURL: model.baseUrl,
+		dangerouslyAllowBrowser: true,
+		defaultHeaders: headers,
+	});
 }
 
 export const streamIflow: StreamFunction<"iflow-completions", IflowOptions> = (
@@ -400,46 +280,76 @@ export const streamIflow: StreamFunction<"iflow-completions", IflowOptions> = (
 				throw new Error("iFlow API key is required. Set IFLOW_API_KEY environment variable or pass apiKey.");
 			}
 
+			// Map pi sessionId to iflow session-id
 			const sessionId = options?.sessionId || generateSessionId();
-			const conversationId = options?.conversationId || crypto.randomUUID();
 			const timestampMs = Date.now();
 			const signature = generateSignature(IFLOW_USER_AGENT, sessionId, timestampMs, apiKey);
-			const params = buildParams(model, context, options, sessionId);
+			const client = createClient(model, apiKey, sessionId, timestampMs, signature, options?.headers);
+
+			// Build params using openai-completions convertMessages with iFlow compat
+			const openaiModel = model as unknown as Model<"openai-completions">;
+			const messages = convertMessages(openaiModel, context, IFLOW_COMPAT);
+
+			const params: Record<string, unknown> = {
+				model: model.id,
+				messages,
+				stream: true,
+				stream_options: { include_usage: true },
+			};
+
+			if (options?.maxTokens) {
+				params.max_tokens = options.maxTokens;
+			}
+
+			if (options?.temperature !== undefined) {
+				params.temperature = options.temperature;
+			}
+
+			if (context.tools && context.tools.length > 0) {
+				params.tools = context.tools.map((tool) => ({
+					type: "function",
+					function: {
+						name: tool.name,
+						description: tool.description,
+						parameters: tool.parameters,
+						strict: false,
+					},
+				}));
+			}
+
+			if (options?.toolChoice) {
+				params.tool_choice = options.toolChoice;
+			}
+
+			// Handle extend_fields - include sessionId for tracking
+			const extendFields: Record<string, unknown> = {
+				...(options?.extendFields ?? {}),
+			};
+			if (!("sessionId" in extendFields)) {
+				extendFields.sessionId = sessionId;
+			}
+			if (Object.keys(extendFields).length > 0) {
+				params.extend_fields = extendFields;
+			}
+
+			// Apply model-specific parameters
+			const modelSpecificParams = applyModelSpecificParams(model, options, context);
+			Object.assign(params, modelSpecificParams);
+
 			options?.onPayload?.(params);
 
-			const response = await fetch(`${model.baseUrl}/chat/completions`, {
-				method: "POST",
-				headers: {
-					...model.headers,
-					"Content-Type": "application/json",
-					Authorization: `Bearer ${apiKey}`,
-					"user-agent": IFLOW_USER_AGENT,
-					"session-id": sessionId,
-					"conversation-id": conversationId,
-					"x-iflow-signature": signature,
-					"x-iflow-timestamp": String(timestampMs),
-					...options?.headers,
-				},
-				body: JSON.stringify(params),
-				signal: options?.signal,
-			});
-
-			if (!response.ok) {
-				const errorBody = await response.text();
-				throw new Error(`iFlow API error: ${response.status} ${response.statusText} ${errorBody}`.trim());
-			}
-
-			const reader = response.body?.getReader();
-			if (!reader) {
-				throw new Error("No response body");
-			}
+			const openaiStream = await client.chat.completions.create(
+				params as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+				{ signal: options?.signal },
+			);
 
 			stream.push({ type: "start", partial: output });
 
-			let currentBlock: StreamingBlock | null = null;
+			let currentBlock: TextContent | ThinkingContent | (ToolCall & { partialArgs?: string }) | null = null;
 			const blocks = output.content;
 			const blockIndex = () => blocks.length - 1;
-			const finishCurrentBlock = (block: StreamingBlock | null) => {
+
+			const finishCurrentBlock = (block?: typeof currentBlock) => {
 				if (!block) return;
 
 				if (block.type === "text") {
@@ -449,163 +359,136 @@ export const streamIflow: StreamFunction<"iflow-completions", IflowOptions> = (
 						content: block.text,
 						partial: output,
 					});
-					return;
-				}
-
-				if (block.type === "thinking") {
+				} else if (block.type === "thinking") {
 					stream.push({
 						type: "thinking_end",
 						contentIndex: blockIndex(),
 						content: block.thinking,
 						partial: output,
 					});
-					return;
+				} else if (block.type === "toolCall") {
+					block.arguments = parseStreamingJson(block.partialArgs);
+					delete block.partialArgs;
+					stream.push({
+						type: "toolcall_end",
+						contentIndex: blockIndex(),
+						toolCall: block,
+						partial: output,
+					});
 				}
-
-				const finalizedToolCall: ToolCall = {
-					type: "toolCall",
-					id: block.id,
-					name: block.name,
-					arguments: parseStreamingJson<Record<string, unknown>>(block.partialArgs),
-				};
-				if (block.thoughtSignature) {
-					finalizedToolCall.thoughtSignature = block.thoughtSignature;
-				}
-				blocks[blockIndex()] = finalizedToolCall;
-				stream.push({
-					type: "toolcall_end",
-					contentIndex: blockIndex(),
-					toolCall: finalizedToolCall,
-					partial: output,
-				});
 			};
 
-			const decoder = new TextDecoder();
-			let buffer = "";
+			for await (const chunk of openaiStream) {
+				// Handle usage (iFlow format)
+				if (chunk.usage) {
+					const usage = chunk.usage as any;
+					const promptTokens = usage.prompt_tokens || 0;
+					const completionTokens = usage.completion_tokens || 0;
+					const totalTokens = usage.total_tokens || promptTokens + completionTokens;
+					const cacheRead = usage.cache_read_input_tokens || 0;
+					const cacheWrite = usage.cache_creation_input_tokens || 0;
 
-			while (true) {
-				const { done, value } = await reader.read();
-				buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-				const { events, remaining } = extractSseDataEvents(buffer);
-				buffer = remaining;
+					output.usage = {
+						input: promptTokens,
+						output: completionTokens,
+						cacheRead,
+						cacheWrite,
+						totalTokens,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					};
+					calculateCost(model, output.usage);
+				}
 
-				for (const eventData of events) {
-					if (eventData === "[DONE]") continue;
+				const choice = chunk.choices[0];
+				if (!choice) continue;
 
-					let chunk: IflowChatCompletionChunk;
-					try {
-						chunk = JSON.parse(eventData) as IflowChatCompletionChunk;
-					} catch {
-						continue;
+				if (choice.finish_reason) {
+					output.stopReason = mapStopReason(choice.finish_reason);
+				}
+
+				if (!choice.delta) continue;
+
+				// Handle text content
+				if (
+					choice.delta.content !== null &&
+					choice.delta.content !== undefined &&
+					choice.delta.content.length > 0
+				) {
+					if (!currentBlock || currentBlock.type !== "text") {
+						finishCurrentBlock(currentBlock);
+						currentBlock = { type: "text", text: "" };
+						output.content.push(currentBlock);
+						stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
 					}
 
-					if (chunk.usage) {
-						const cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens || 0;
-						const reasoningTokens = chunk.usage.completion_tokens_details?.reasoning_tokens || 0;
-						const promptTokens = chunk.usage.prompt_tokens || 0;
-						const completionTokens = chunk.usage.completion_tokens || 0;
-						const input = promptTokens - cachedTokens;
-						const outputTokens = completionTokens + reasoningTokens;
-						output.usage = {
-							input,
-							output: outputTokens,
-							cacheRead: cachedTokens,
-							cacheWrite: 0,
-							totalTokens: input + outputTokens + cachedTokens,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					if (currentBlock.type === "text") {
+						currentBlock.text += choice.delta.content;
+						stream.push({
+							type: "text_delta",
+							contentIndex: blockIndex(),
+							delta: choice.delta.content,
+							partial: output,
+						});
+					}
+				}
+
+				// Handle reasoning content (reasoning_content, reasoning, reasoning_text)
+				const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"];
+				let foundReasoningField: string | null = null;
+				for (const field of reasoningFields) {
+					const value = (choice.delta as any)[field];
+					if (value !== null && value !== undefined && value.length > 0) {
+						foundReasoningField = field;
+						break;
+					}
+				}
+
+				if (foundReasoningField) {
+					if (!currentBlock || currentBlock.type !== "thinking") {
+						finishCurrentBlock(currentBlock);
+						currentBlock = {
+							type: "thinking",
+							thinking: "",
+							thinkingSignature: foundReasoningField,
 						};
-						calculateCost(model, output.usage);
+						output.content.push(currentBlock);
+						stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
 					}
 
-					const choice = chunk.choices[0];
-					if (!choice) continue;
-
-					if (choice.finish_reason) {
-						output.stopReason = mapStopReason(choice.finish_reason);
+					if (currentBlock.type === "thinking") {
+						const delta = (choice.delta as any)[foundReasoningField];
+						currentBlock.thinking += delta;
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: blockIndex(),
+							delta,
+							partial: output,
+						});
 					}
+				}
 
-					const { delta } = choice;
-					if (!delta) continue;
-
-					if (delta.content !== null && delta.content !== undefined && delta.content.length > 0) {
-						if (!currentBlock || currentBlock.type !== "text") {
-							finishCurrentBlock(currentBlock);
-							currentBlock = { type: "text", text: "" };
-							output.content.push(currentBlock);
-							stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
-						}
-
-						if (currentBlock.type === "text") {
-							currentBlock.text += delta.content;
-							stream.push({
-								type: "text_delta",
-								contentIndex: blockIndex(),
-								delta: delta.content,
-								partial: output,
-							});
-						}
-					}
-
-					const reasoningDelta = getReasoningDelta(delta);
-					if (reasoningDelta) {
-						if (!currentBlock || currentBlock.type !== "thinking") {
-							finishCurrentBlock(currentBlock);
-							currentBlock = {
-								type: "thinking",
-								thinking: "",
-								thinkingSignature: reasoningDelta.field,
-							};
-							output.content.push(currentBlock);
-							stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
-						}
-
-						if (currentBlock.type === "thinking") {
-							currentBlock.thinking += reasoningDelta.value;
-							stream.push({
-								type: "thinking_delta",
-								contentIndex: blockIndex(),
-								delta: reasoningDelta.value,
-								partial: output,
-							});
-						}
-					}
-
-					if (delta.tool_calls) {
-						for (const toolCall of delta.tool_calls) {
-							if (
-								!currentBlock ||
-								currentBlock.type !== "toolCall" ||
-								(toolCall.id && currentBlock.id !== toolCall.id)
-							) {
+				// Handle MiniMax reasoning_details format
+				const reasoningDetails = (choice.delta as any).reasoning_details;
+				if (reasoningDetails && Array.isArray(reasoningDetails)) {
+					for (const detail of reasoningDetails) {
+						if (detail.type === "reasoning.text" && detail.text) {
+							if (!currentBlock || currentBlock.type !== "thinking") {
 								finishCurrentBlock(currentBlock);
 								currentBlock = {
-									type: "toolCall",
-									id: toolCall.id || "",
-									name: toolCall.function?.name || "",
-									arguments: {},
-									partialArgs: "",
+									type: "thinking",
+									thinking: "",
+									thinkingSignature: "reasoning_details",
 								};
 								output.content.push(currentBlock);
-								stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+								stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
 							}
 
-							if (currentBlock.type === "toolCall") {
-								if (toolCall.id) currentBlock.id = toolCall.id;
-								if (toolCall.function?.name) currentBlock.name = toolCall.function.name;
-
-								let argsDelta = "";
-								if (toolCall.function?.arguments) {
-									argsDelta = toolCall.function.arguments;
-									currentBlock.partialArgs = `${currentBlock.partialArgs ?? ""}${argsDelta}`;
-									currentBlock.arguments = parseStreamingJson<Record<string, unknown>>(
-										currentBlock.partialArgs,
-									);
-								}
-
+							if (currentBlock.type === "thinking") {
+								currentBlock.thinking += detail.text;
 								stream.push({
-									type: "toolcall_delta",
+									type: "thinking_delta",
 									contentIndex: blockIndex(),
-									delta: argsDelta,
+									delta: detail.text,
 									partial: output,
 								});
 							}
@@ -613,7 +496,44 @@ export const streamIflow: StreamFunction<"iflow-completions", IflowOptions> = (
 					}
 				}
 
-				if (done) break;
+				// Handle tool calls
+				if (choice.delta.tool_calls) {
+					for (const toolCall of choice.delta.tool_calls) {
+						if (
+							!currentBlock ||
+							currentBlock.type !== "toolCall" ||
+							(toolCall.id && currentBlock.id !== toolCall.id)
+						) {
+							finishCurrentBlock(currentBlock);
+							currentBlock = {
+								type: "toolCall",
+								id: toolCall.id || "",
+								name: toolCall.function?.name || "",
+								arguments: {},
+								partialArgs: "",
+							};
+							output.content.push(currentBlock);
+							stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+						}
+
+						if (currentBlock.type === "toolCall") {
+							if (toolCall.id) currentBlock.id = toolCall.id;
+							if (toolCall.function?.name) currentBlock.name = toolCall.function.name;
+							let delta = "";
+							if (toolCall.function?.arguments) {
+								delta = toolCall.function.arguments;
+								currentBlock.partialArgs += toolCall.function.arguments;
+								currentBlock.arguments = parseStreamingJson(currentBlock.partialArgs);
+							}
+							stream.push({
+								type: "toolcall_delta",
+								contentIndex: blockIndex(),
+								delta,
+								partial: output,
+							});
+						}
+					}
+				}
 			}
 
 			finishCurrentBlock(currentBlock);
@@ -629,6 +549,7 @@ export const streamIflow: StreamFunction<"iflow-completions", IflowOptions> = (
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			for (const block of output.content) delete (block as any).index;
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -650,12 +571,11 @@ export const streamSimpleIflow: StreamFunction<"iflow-completions", SimpleStream
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
-	const reasoningEffort = options?.reasoning ? clampReasoning(options.reasoning) : undefined;
 	const toolChoice = (options as IflowOptions | undefined)?.toolChoice;
+	const modelSupportsSetThink = supportsSetThink(model.id);
 
-	// Explicitly control thinking state - must disable for reasoning models when not requested
-	// Similar to how zai handles thinking: { type: "enabled" | "disabled" }
-	const thinking = model.reasoning
+	const reasoningEffort = modelSupportsSetThink && options?.reasoning ? clampReasoning(options.reasoning) : undefined;
+	const thinking = modelSupportsSetThink
 		? options?.reasoning
 			? { type: "enabled" as const }
 			: { type: "disabled" as const }
