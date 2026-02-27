@@ -22,13 +22,12 @@
 		"version:major": "npm version major -ws --no-git-tag-version && node scripts/sync-versions.js && rm -rf node_modules packages/*/node_modules package-lock.json && npm install",
 		"version:set": "npm version -ws",
 		"prepublishOnly": "npm run clean && npm run build && npm run check",
-		"publish": "echo \"publish disabled for git dependency prepare\"",
+		"publish": "npm run prepublishOnly && npm publish -ws --access public",
 		"publish:dry": "npm run prepublishOnly && npm publish -ws --access public --dry-run",
 		"release:patch": "node scripts/release.mjs patch",
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",
-		"prepare": "husky",
-		"publish:ws": "npm run prepublishOnly && npm publish -ws --access public"
+		"prepare": "husky"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.3.5",
@@ -45,7 +44,7 @@
 	"version": "0.0.3",
 	"dependencies": {
 		"@mariozechner/jiti": "^2.6.5",
-		"@mariozechner/pi-coding-agent": "^0.30.2",
+		"@synth-coder/pi-coding-agent": "^0.30.2",
 		"get-east-asian-width": "^1.4.0",
 		"koffi": "^2.15.1"
 	},
