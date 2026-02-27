@@ -162,7 +162,7 @@ function isThinkingEnabled(options: IflowOptions | undefined, model: Model<"iflo
 
 /**
  * Apply model-specific parameters based on iFlow documentation.
- * Section 9: 9 models' chat/completions parameter Schema
+ * Only apply context-related parameters that are essential for model behavior.
  */
 function applyModelSpecificParams(
 	model: Model<"iflow-completions">,
@@ -174,42 +174,19 @@ function applyModelSpecificParams(
 	const hasTools = context.tools && context.tools.length > 0;
 
 	switch (model.id) {
-		// 1) GLM-4.7
-		case "glm-4.7": {
-			params.temperature = 1;
-			params.top_p = 0.95;
-			params.chat_template_kwargs = { enable_thinking: thinkingEnabled };
-			params.max_new_tokens = 32000;
-			break;
-		}
-
-		// 2) iFlow-ROME-30BA3B
-		case "iFlow-ROME-30BA3B": {
-			params.temperature = 0.7;
-			params.top_p = 0.8;
-			params.top_k = 20;
-			params.max_new_tokens = 64000;
-			break;
-		}
-
-		// 3) DeepSeek-V3.2
+		// 3) DeepSeek-V3.2 - only model rewrite for reasoning
 		case "deepseek-v3.2": {
 			// When thinking is enabled, model is rewritten to deepseek-v3.2-reasoner
 			if (thinkingEnabled) {
 				params.model = "deepseek-v3.2-reasoner";
 				// Reasoner model does not support max_tokens, remove it
 				delete params.max_tokens;
-			} else {
-				params.max_tokens = 64000;
 			}
-			params.max_new_tokens = 64000;
 			break;
 		}
 
-		// 4) GLM-5
+		// 4) GLM-5 - only thinking configuration
 		case "glm-5": {
-			params.temperature = 1;
-			params.top_p = 0.95;
 			if (thinkingEnabled) {
 				params.chat_template_kwargs = { enable_thinking: true };
 				params.enable_thinking = true;
@@ -219,40 +196,19 @@ function applyModelSpecificParams(
 				params.enable_thinking = false;
 				params.thinking = { type: "disabled" };
 			}
-			params.max_new_tokens = 32000;
 			break;
 		}
 
-		// 5) Qwen3-Coder-Plus
-		case "qwen3-coder-plus": {
-			params.max_new_tokens = 64000;
-			break;
-		}
-
-		// 6) Kimi-K2-Thinking
+		// 6) Kimi-K2-Thinking - only thinking configuration
 		case "kimi-k2-thinking": {
 			if (thinkingEnabled) {
 				params.thinking_mode = true;
 			}
-			params.max_new_tokens = 32000;
 			break;
 		}
 
-		// 7) MiniMax-M2.5
-		case "minimax-m2.5": {
-			params.max_new_tokens = 64000;
-			break;
-		}
-
-		// 8) Kimi-K2.5 (special case - most forced parameters)
+		// 8) Kimi-K2.5 - only essential thinking and tool configuration
 		case "kimi-k2.5": {
-			params.top_p = 0.95;
-			params.n = 1;
-			params.presence_penalty = 0;
-			params.frequency_penalty = 0;
-			params.max_tokens = 32768;
-			params.max_new_tokens = 32768;
-			// temperature is cleared (not sent)
 			if (thinkingEnabled) {
 				params.thinking = { type: "enabled" };
 			}
@@ -260,12 +216,6 @@ function applyModelSpecificParams(
 			if (hasTools && !options?.toolChoice) {
 				params.tool_choice = "auto";
 			}
-			break;
-		}
-
-		// 9) Kimi-K2-0905
-		case "kimi-k2-0905": {
-			params.max_new_tokens = 32000;
 			break;
 		}
 
@@ -360,15 +310,9 @@ function buildParams(
 		params.extend_fields = extendFields;
 	}
 
-	// Apply model-specific parameters (Section 9 of iFlow documentation)
-	// These set forced defaults and model-specific configurations
+	// Apply model-specific parameters (only essential context-related configurations)
 	const modelSpecificParams = applyModelSpecificParams(model, options, context);
 	Object.assign(params, modelSpecificParams);
-
-	// Handle special case: Kimi-K2.5 clears temperature (doesn't send it)
-	if (model.id === "kimi-k2.5") {
-		delete params.temperature;
-	}
 
 	return params;
 }
