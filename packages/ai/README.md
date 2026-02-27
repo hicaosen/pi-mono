@@ -63,6 +63,7 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - **Google Gemini CLI** (requires OAuth, see below)
 - **Antigravity** (requires OAuth, see below)
 - **Amazon Bedrock**
+- **iFlow**
 - **Kimi For Coding** (Moonshot AI, uses Anthropic-compatible API)
 - **Any OpenAI-compatible API**: Ollama, vLLM, LM Studio, etc.
 

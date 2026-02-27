@@ -307,6 +307,25 @@ describe("totalTokens field", () => {
 	});
 
 	// =========================================================================
+	// iFlow
+	// =========================================================================
+
+	describe.skipIf(!process.env.IFLOW_API_KEY)("iFlow", () => {
+		it("glm-4.7 - should return totalTokens equal to sum of components", { retry: 3, timeout: 60000 }, async () => {
+			const llm = getModel("iflow", "glm-4.7");
+
+			console.log(`\niFlow / ${llm.id}:`);
+			const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.IFLOW_API_KEY });
+
+			logUsage("First request", first);
+			logUsage("Second request", second);
+
+			assertTotalTokensEqualsComponents(first);
+			assertTotalTokensEqualsComponents(second);
+		});
+	});
+
+	// =========================================================================
 	// Hugging Face
 	// =========================================================================
 

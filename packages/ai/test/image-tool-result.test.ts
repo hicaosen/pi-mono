@@ -300,6 +300,18 @@ describe("Tool Results with Images", () => {
 		});
 	});
 
+	describe.skipIf(!process.env.IFLOW_API_KEY)("iFlow Provider (glm-4.7)", () => {
+		const llm = getModel("iflow", "glm-4.7");
+
+		it("should handle tool result with only image", { retry: 3, timeout: 30000 }, async () => {
+			await handleToolWithImageResult(llm);
+		});
+
+		it("should handle tool result with text and image", { retry: 3, timeout: 30000 }, async () => {
+			await handleToolWithTextAndImageResult(llm);
+		});
+	});
+
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider (k2p5)", () => {
 		const llm = getModel("kimi-coding", "k2p5");
 

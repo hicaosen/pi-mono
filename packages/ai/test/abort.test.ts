@@ -193,6 +193,18 @@ describe("AI Providers Abort Tests", () => {
 		});
 	});
 
+	describe.skipIf(!process.env.IFLOW_API_KEY)("iFlow Provider Abort", () => {
+		const llm = getModel("iflow", "glm-4.7");
+
+		it("should abort mid-stream", { retry: 3 }, async () => {
+			await testAbortSignal(llm);
+		});
+
+		it("should handle immediate abort", { retry: 3 }, async () => {
+			await testImmediateAbort(llm);
+		});
+	});
+
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider Abort", () => {
 		const llm = getModel("kimi-coding", "kimi-k2-thinking");
 

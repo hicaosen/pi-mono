@@ -168,6 +168,14 @@ describe("Tool Call Without Result Tests", () => {
 		});
 	});
 
+	describe.skipIf(!process.env.IFLOW_API_KEY)("iFlow Provider", () => {
+		const model = getModel("iflow", "glm-4.7");
+
+		it("should filter out tool calls without corresponding tool results", { retry: 3, timeout: 30000 }, async () => {
+			await testToolCallWithoutResult(model);
+		});
+	});
+
 	describe.skipIf(!process.env.HF_TOKEN)("Hugging Face Provider", () => {
 		const model = getModel("huggingface", "moonshotai/Kimi-K2.5");
 

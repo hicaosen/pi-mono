@@ -154,6 +154,14 @@ describe("Token Statistics on Abort", () => {
 		});
 	});
 
+	describe.skipIf(!process.env.IFLOW_API_KEY)("iFlow Provider", () => {
+		const llm = getModel("iflow", "glm-4.7");
+
+		it("should include token stats when aborted mid-stream", { retry: 3, timeout: 30000 }, async () => {
+			await testTokensOnAbort(llm);
+		});
+	});
+
 	describe.skipIf(!process.env.HF_TOKEN)("Hugging Face Provider", () => {
 		const llm = getModel("huggingface", "moonshotai/Kimi-K2.5");
 
