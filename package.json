@@ -22,12 +22,13 @@
 		"version:major": "npm version major -ws --no-git-tag-version && node scripts/sync-versions.js && rm -rf node_modules packages/*/node_modules package-lock.json && npm install",
 		"version:set": "npm version -ws",
 		"prepublishOnly": "npm run clean && npm run build && npm run check",
-		"publish": "npm run prepublishOnly && npm publish -ws --access public",
+		"publish": "echo \"publish disabled for git dependency prepare\"",
 		"publish:dry": "npm run prepublishOnly && npm publish -ws --access public --dry-run",
 		"release:patch": "node scripts/release.mjs patch",
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",
-		"prepare": "husky"
+		"prepare": "husky",
+		"publish:ws": "npm run prepublishOnly && npm publish -ws --access public"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.3.5",
