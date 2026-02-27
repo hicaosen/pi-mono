@@ -197,9 +197,9 @@ function applyModelSpecificParams(
 			// When thinking is enabled, model is rewritten to deepseek-v3.2-reasoner
 			if (thinkingEnabled) {
 				params.model = "deepseek-v3.2-reasoner";
-			}
-			// Only set max_tokens when model is NOT deepseek-v3.2-reasoner
-			if (params.model !== "deepseek-v3.2-reasoner") {
+				// Reasoner model does not support max_tokens, remove it
+				delete params.max_tokens;
+			} else {
 				params.max_tokens = 64000;
 			}
 			params.max_new_tokens = 64000;
@@ -709,9 +709,18 @@ export const streamSimpleIflow: StreamFunction<"iflow-completions", SimpleStream
 	const reasoningEffort = options?.reasoning ? clampReasoning(options.reasoning) : undefined;
 	const toolChoice = (options as IflowOptions | undefined)?.toolChoice;
 
+	// Explicitly control thinking state - must disable for reasoning models when not requested
+	// Similar to how zai handles thinking: { type: "enabled" | "disabled" }
+	const thinking = model.reasoning
+		? options?.reasoning
+			? { type: "enabled" as const }
+			: { type: "disabled" as const }
+		: undefined;
+
 	return streamIflow(model, context, {
 		...base,
 		reasoningEffort,
 		toolChoice,
+		thinking,
 	} as unknown as IflowOptions);
 };
