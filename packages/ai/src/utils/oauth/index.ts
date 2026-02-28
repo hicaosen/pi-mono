@@ -59,6 +59,7 @@ const BUILT_IN_OAUTH_PROVIDERS: OAuthProviderInterface[] = [
 	githubCopilotOAuthProvider,
 	geminiCliOAuthProvider,
 	antigravityOAuthProvider,
+	iflowOAuthProvider,
 	openaiCodexOAuthProvider,
 ];
 
